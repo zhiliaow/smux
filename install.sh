@@ -3,7 +3,7 @@
 set -euo pipefail
 
 VERSION="1.0.0"
-REPO="ShawnPana/smux"
+REPO="zhiliaow/smux"
 BRANCH="main"
 BASE_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 SMUX_DIR="$HOME/.smux"

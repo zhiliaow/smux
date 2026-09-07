@@ -3,7 +3,7 @@
 # Any tool that can run bash can use this to talk to other panes.
 set -euo pipefail
 
-VERSION="2.0.0"
+VERSION="2.1.2"
 
 # --- Helpers ---
 
@@ -117,7 +117,8 @@ Usage: tmux-bridge <command> [args...]
 Commands:
   list                      Show all panes (target, pid, command, size, label)
   type <target> <text>      Type text without pressing Enter
-  message <target> <text>   Type text with auto-prepended sender info and reply target
+  send <target> <text>      Send a framed agent message and press Enter (preferred)
+  message <target> <text>   Draft a framed agent message without pressing Enter
   read <target> [lines]     Read last N lines from pane (default: 50)
   keys <target> <key>...    Send special keys (Enter, Escape, C-c, etc.)
   name <target> <label>     Label a pane (visible in tmux border)
@@ -227,14 +228,8 @@ cmd_type() {
   clear_read "$target"
 }
 
-cmd_message() {
-  require_args 2 $# "message"
-  require_tmux
-  local target
-  target=$(resolve_target "$1")
-  validate_target "$target"
-  require_read "$target"
-
+framed_message() {
+  local text="$1"
   # Detect sender identity and location
   local sender_pane="${TMUX_PANE:-}"
   if [[ -z "$sender_pane" ]]; then
@@ -247,8 +242,74 @@ cmd_message() {
   session_win=$(tmx display-message -t "$sender_pane" -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || true)
 
   local header="[tmux-bridge from:${from} pane:${sender_pane} at:${session_win} — load the smux skill to reply]"
-  tmx send-keys -t "$target" -l -- "${header} $2"
+  printf '%s' "${header} ${text}"
+}
+
+paste_for_tui() {
+  local target="$1" text="$2"
+  local buffer="tmux-bridge-${$}-${RANDOM}"
+
+  # send-keys -l queues long UTF-8 messages byte by byte. An Enter sent
+  # immediately afterwards can arrive before the target TUI finishes input.
+  # A bracketed tmux paste delivers the message as one paste operation instead.
+  printf '%s' "$text" | tmx load-buffer -b "$buffer" -
+  tmx paste-buffer -p -r -d -b "$buffer" -t "$target"
+}
+
+wait_for_pane_quiet() {
+  local target="$1"
+  local previous="" current=""
+  local stable=0
+
+  # paste-buffer returns before an interactive TUI necessarily consumes and
+  # renders all input. Wait for four unchanged screen snapshots before Enter,
+  # with a bounded five-second fallback.
+  sleep 0.4
+  for ((i = 0; i < 50; i++)); do
+    current=$(tmx capture-pane -t "$target" -p -J | cksum)
+    if [[ "$current" == "$previous" ]]; then
+      ((stable += 1))
+      if ((stable >= 4)); then
+        return
+      fi
+    else
+      stable=0
+      previous="$current"
+    fi
+    sleep 0.1
+  done
+}
+
+cmd_send() {
+  require_args 2 $# "send"
+  require_tmux
+  local target text
+  target=$(resolve_target "$1")
+  validate_target "$target"
+  require_read "$target"
+  text=$(framed_message "$2")
+
+  # Keep paste and submission in one command so callers cannot forget Enter.
+  # Wait for the TUI to finish rendering long messages before submitting.
+  paste_for_tui "$target" "$text"
+  wait_for_pane_quiet "$target"
+  tmx send-keys -t "$target" Enter
   clear_read "$target"
+  echo "send attempted to $target; verification required"
+}
+
+cmd_message() {
+  require_args 2 $# "message"
+  require_tmux
+  local target text
+  target=$(resolve_target "$1")
+  validate_target "$target"
+  require_read "$target"
+  text=$(framed_message "$2")
+
+  tmx send-keys -t "$target" -l -- "$text"
+  clear_read "$target"
+  echo "drafted in $target; NOT submitted (use 'send' for agent messages)"
 }
 
 cmd_read() {
@@ -393,6 +454,7 @@ init_socket
 case "$1" in
   list)    shift; cmd_list "$@" ;;
   type)    shift; cmd_type "$@" ;;
+  send)    shift; cmd_send "$@" ;;
   message|msg) shift; cmd_message "$@" ;;
   read)    shift; cmd_read "$@" ;;
   keys)    shift; cmd_keys "$@" ;;
